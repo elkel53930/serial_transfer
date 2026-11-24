@@ -17,6 +17,9 @@ HEADER_FORMAT = "<4sQI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 CHUNK_SIZE = 1024
+CHUNK_CRC_FORMAT = "<I"
+CHUNK_CRC_SIZE = struct.calcsize(CHUNK_CRC_FORMAT)
+MAX_RETRIES = 3
 ACK = b"\x06"
 NAK = b"\x15"
 
@@ -56,7 +59,6 @@ def send_file(ser, filename):
     print(f"Size: {file_size} bytes")
     print(f"CRC32: {crc:08X}")
 
-    # Send header
     header = struct.pack(
         HEADER_FORMAT,
         MAGIC,
@@ -67,23 +69,40 @@ def send_file(ser, filename):
     ser.write(header)
     ser.flush()
 
-    # Wait for receiver ready
     if read_exact(ser, 1) != ACK:
         raise RuntimeError("Receiver not ready")
 
-    # Send data
     sent = 0
+    chunk_index = 0
 
     with open(filename, "rb") as f:
         while True:
-            data = f.read(CHUNK_SIZE)
-            if not data:
+            chunk_data = f.read(CHUNK_SIZE)
+            if not chunk_data:
                 break
 
-            ser.write(data)
-            ser.flush()
+            chunk_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
+            chunk_payload = chunk_data + struct.pack(CHUNK_CRC_FORMAT, chunk_crc)
 
-            sent += len(data)
+            for attempt in range(MAX_RETRIES + 1):
+                ser.write(chunk_payload)
+                ser.flush()
+
+                response = read_exact(ser, 1)
+
+                if response == ACK:
+                    break
+                elif response == NAK:
+                    if attempt < MAX_RETRIES:
+                        print(f"\nChunk {chunk_index} CRC error, retrying ({attempt + 1}/{MAX_RETRIES})...")
+                        continue
+                    else:
+                        raise RuntimeError(f"Chunk {chunk_index} failed after {MAX_RETRIES} retries")
+                else:
+                    raise RuntimeError(f"Unexpected response: {response!r}")
+
+            sent += len(chunk_data)
+            chunk_index += 1
 
             print(
                 f"\rSending: {sent}/{file_size} bytes "
@@ -91,7 +110,6 @@ def send_file(ser, filename):
                 end=""
             )
 
-    # Wait for final result
     result = read_exact(ser, 1)
 
     print()
@@ -107,7 +125,6 @@ def receive_file(ser, filename):
 
     print("Waiting for sender...")
 
-    # Receive header
     header = read_exact(ser, HEADER_SIZE)
 
     magic, file_size, expected_crc = struct.unpack(
@@ -122,28 +139,53 @@ def receive_file(ser, filename):
     print(f"Size: {file_size} bytes")
     print(f"Expected CRC32: {expected_crc:08X}")
 
-    # Tell sender we are ready
     ser.write(ACK)
     ser.flush()
 
     received = 0
     crc = 0
 
-    # Write to temporary file
     temp_filename = filename + ".part"
 
     try:
         with open(temp_filename, "wb") as f:
             while received < file_size:
 
-                size = min(CHUNK_SIZE, file_size - received)
+                chunk_size = min(CHUNK_SIZE, file_size - received)
+                chunk_total_size = chunk_size + CHUNK_CRC_SIZE
 
-                data = read_exact(ser, size)
+                chunk_accepted = False
 
-                f.write(data)
-                crc = zlib.crc32(data, crc)
+                for attempt in range(MAX_RETRIES + 1):
+                    chunk_payload = read_exact(ser, chunk_total_size)
+                    chunk_data = chunk_payload[:chunk_size]
+                    received_chunk_crc = struct.unpack(
+                        CHUNK_CRC_FORMAT,
+                        chunk_payload[chunk_size:]
+                    )[0]
 
-                received += len(data)
+                    calculated_chunk_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
+
+                    if calculated_chunk_crc == received_chunk_crc:
+                        ser.write(ACK)
+                        ser.flush()
+                        chunk_accepted = True
+                        break
+                    else:
+                        ser.write(NAK)
+                        ser.flush()
+                        if attempt < MAX_RETRIES:
+                            print(f"\nChunk CRC error at offset {received}, waiting for retransmission ({attempt + 1}/{MAX_RETRIES})...")
+
+                if not chunk_accepted:
+                    raise RuntimeError(
+                        f"Chunk at offset {received} failed after {MAX_RETRIES} retries"
+                    )
+
+                f.write(chunk_data)
+                crc = zlib.crc32(chunk_data, crc)
+
+                received += len(chunk_data)
 
                 print(
                     f"\rReceiving: {received}/{file_size} bytes "
@@ -206,7 +248,7 @@ def main():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=30.0
+        default=5.0
     )
 
     args = parser.parse_args()
